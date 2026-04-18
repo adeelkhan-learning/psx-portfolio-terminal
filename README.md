@@ -86,3 +86,12 @@ This application processes highly sensitive personal financial data. Ensure that
 
 License
 This project is licensed under the MIT License. See the LICENSE file for details.
+
+## ⚖️ Legal Disclaimer
+
+This project is open-source and intended solely for **educational and personal use**. 
+
+* **Data Ownership:** All market data, stock prices, and related financial information accessed via this script are the exclusive property of the Pakistan Stock Exchange (PSX). 
+* **No Commercial Use:** This tool is not intended for commercial use, data redistribution, or monetization. Do not use this codebase to bypass PSX Data Services Vending programs.
+* **Rate Limiting & Server Respect:** The dashboard architecture deliberately incorporates server-side caching to respect PSX server resources and prevent high-frequency scraping. Users modifying this code are strongly advised to maintain these ethical scraping limits.
+* **Liability:** The author of this repository is not responsible for any financial losses, trading errors, or legal repercussions resulting from the use of this software. By cloning or running this code, you accept full responsibility for your actions and your compliance with PSX Terms of Use.

@@ -13,7 +13,7 @@ Deterministic Cleaning: Applies Python regex to sanitize broker extensions (e.g.
 Automated Ledger: Maintains a centralized Excel database (PSX_Portfolio_Tracker.xlsx), automatically categorizing Trades, Dividends, and Fund Transfers while preventing duplicate entries.
 
 2. Live Portfolio Dashboard (app.py)
-Real-Time Market Data: Uses a headless Selenium browser to scrape live one time intraday prices directly from the PSX portal. To get the current value, you need to refresh the page. This is just to calculate on the moment status of the stocks I have purchased.
+Top Ticker: Shows the current stock price and average price of stock I bought and calculates if its in positive or negative trend.
 
 Advanced Analytics: Tracks realized and unrealized profit/loss, visualizes asset allocation, and provides a running cash-flow balance of deposits and withdrawals.
 

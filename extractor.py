@@ -149,7 +149,7 @@ def extract_images_from_pdf(pdf_path):
         return []
 
 def parse_trade_data_with_vision(pdf_path):
-    """Sends the actual images of the document to Groq's Llama 4 Scout Vision model."""
+    """Sends the actual images of the document to Groq's GPT OSS 120B."""
     base64_images = extract_images_from_pdf(pdf_path)
     if not base64_images:
         return None
@@ -162,20 +162,38 @@ def parse_trade_data_with_vision(pdf_path):
     1. "Ticker": Perform STRICT literal character-by-character transcription of the symbol column. DO NOT auto-correct spelling, and DO NOT inject extra vowels. If the image says 'CNERGY', do NOT output 'CENERGY'. If it says 'MZNPETF', do NOT output 'MZNPEETF'. Copy the letters EXACTLY as printed. Include the broker extensions (e.g., "-READY") if present.
     2. "Printed Taxes": Look visually at the table grid. Extract the exact number written in the Taxes/Levies column for EACH specific row. Do not calculate it. Do not let numbers bleed together.
     3. "Printed Net Value": Extract the final number on that specific row. DO NOT grab the Grand Total at the bottom of the page.
+    4. CRITICAL IPO RULE: If the text contains "Subscription application has been successful" (e.g., eIPO emails), you MUST treat it as an IPO Allotment. Do NOT attempt to calculate the Price or Net Value. Map the "Security Name" to its exact PSX ticker (e.g., "SERVICE LONG MARCH TYRES LIMITED" -> "SLM"). Extract the exact "Amount Paid" and "Amount to be Refunded".
+
+    You MUST return EXACTLY a JSON object containing a single key "trades". Do not include markdown tags.
     
-    You MUST return EXACTLY this JSON format and nothing else. Do not include markdown tags.
+    If it is a STANDARD TRADE, use exactly this format:
     {
       "trades": [
         {
           "Trade Date": "YYYY-MM-DD",
           "Settlement Date": "YYYY-MM-DD",
-          "Transaction Type": "BUY",  // MUST be "BUY", "SELL", or "IPO". If the document says "PURCHASE", output "BUY".
+          "Transaction Type": "BUY",  // MUST be "BUY" or "SELL". If "PURCHASE", output "BUY".
           "Ticker": "ILP",
           "Quantity": 500,
           "Price": 75.40,
           "Commission": 56.55,
           "Printed Taxes": 0.75,
           "Printed Net Value": 37757.3
+        }
+      ]
+    }
+
+    If it is an IPO ALLOTMENT, use exactly this format:
+    {
+      "trades": [
+        {
+          "Trade Date": "YYYY-MM-DD",
+          "Settlement Date": "YYYY-MM-DD",
+          "Transaction Type": "IPO",
+          "Ticker": "SLM",
+          "Quantity": 584,
+          "IPO Amount Paid": 99750.0,
+          "IPO Amount Refunded": 88099.20
         }
       ]
     }
@@ -198,7 +216,7 @@ def parse_trade_data_with_vision(pdf_path):
                     "content": content_array
                 }
             ],
-            model="meta-llama/llama-4-scout-17b-16e-instruct", 
+            model="qwen/qwen3.6-27b", 
             temperature=0, 
         )
         
@@ -214,60 +232,90 @@ def parse_trade_data_with_vision(pdf_path):
         # --- PYTHON SANITY CHECK & MATH ---
         for trade in trades_list:
             
-            # 1. --- THE TRUE REGEX FIX (No Dictionary Needed) ---
+            # 1. --- YOUR EXISTING REGEX & OCR FIXES ---
             raw_ticker = str(trade.get("Ticker", "")).upper().strip()
-            
-            # This safely removes extensions ONLY if preceded by a dash or space. 
-            # "OGDC-OCT" becomes "OGDC". "OCTOPUS" remains "OCTOPUS".
             clean_ticker = re.sub(r'[\-\s]+(READY|FUTURE|SPOT|JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b.*', '', raw_ticker).strip()
             
-            # 2. Fix the AI's visual reading errors
             if clean_ticker == "MZNPEETF":
                 clean_ticker = "MZNPETF"
             elif clean_ticker == "CENERGY":
                 clean_ticker = "CNERGY"
             
             trade["Ticker"] = clean_ticker
-            # -------------------------------------------------
             
-            base_value = trade.get("Price", 0.0) * trade.get("Quantity", 0)
-            commission = trade.get("Commission", 0.0)
-            printed_net = trade.get("Printed Net Value", 0.0)
-            printed_tax = trade.get("Printed Taxes", 0.0)
-            
-            max_logical_tax = base_value * 0.05 
-            
-            tx_type = str(trade.get("Transaction Type", "")).upper().strip()
-            
-            if tx_type == "PURCHASE":
-                tx_type = "BUY"
-                trade["Transaction Type"] = "BUY"
-            
-            if tx_type == "IPO":
-                trade["Taxes and Fees"] = 0.0
-                trade["Net Total Value"] = round((trade.get("Price", 0.0) * trade.get("Quantity", 0)), 2)
+            # Helper function to safely strip commas and convert to float
+            def clean_number(val):
+                if isinstance(val, str):
+                    # Removes anything that isn't a digit or a decimal point
+                    clean_str = re.sub(r'[^\d.]', '', val)
+                    return float(clean_str) if clean_str else 0.0
+                return float(val) if val else 0.0
+
+            # Determine if this is an IPO based on the keys OR the transaction type
+            tx_type_raw = str(trade.get("Transaction Type", "")).upper()
+            is_ipo_transaction = "IPO" in tx_type_raw or "ALLOTMENT" in tx_type_raw
+            has_ipo_keys = "IPO Amount Paid" in trade and "IPO Amount Refunded" in trade
+
+            # 2. --- NEW: BULLETPROOF IPO MATH ---
+            if has_ipo_keys or is_ipo_transaction:
+                # Grab the values safely, stripping any commas the AI left behind
+                paid = clean_number(trade.get("IPO Amount Paid", 0.0))
+                refund = clean_number(trade.get("IPO Amount Refunded", 0.0))
+                qty = int(clean_number(trade.get("Quantity", 0)))
                 
-            elif tx_type == "BUY":
-                calc_tax = printed_net - base_value - commission
-                if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
-                    trade["Taxes and Fees"] = round(calc_tax, 2)
-                    trade["Net Total Value"] = round(printed_net, 2)
-                else:
-                    trade["Taxes and Fees"] = round(printed_tax, 2)
-                    trade["Net Total Value"] = round(base_value + commission + printed_tax, 2)
+                # If the AI successfully grabbed the paid/refund amounts, do the perfect math
+                if paid > 0:
+                    net_total = paid - refund
+                    exact_price = net_total / qty if qty > 0 else 0.0
                     
-            elif tx_type == "SELL":
-                calc_tax = base_value - printed_net - commission
-                if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
-                    trade["Taxes and Fees"] = round(calc_tax, 2)
-                    trade["Net Total Value"] = round(printed_net, 2)
+                    trade["Net Total Value"] = round(net_total, 2)
+                    trade["Price"] = round(exact_price, 4)
                 else:
-                    trade["Taxes and Fees"] = round(printed_tax, 2)
-                    trade["Net Total Value"] = round(base_value - commission - printed_tax, 2)
+                    # Failsafe: if AI completely failed to grab the amounts, use Quantity * Price as a last resort
+                    trade["Net Total Value"] = round((clean_number(trade.get("Price", 0.0)) * qty), 2)
+                
+                trade["Commission"] = 0.0
+                trade["Taxes and Fees"] = 0.0
+                trade["Transaction Type"] = "IPO Allotment"
+                
+                # Clean up temporary IPO keys so they don't break Excel formatting
+                trade.pop("IPO Amount Paid", None)
+                trade.pop("IPO Amount Refunded", None)
+                
+            # 3. --- YOUR EXISTING STANDARD TRADE MATH ---
+            else:
+                base_value = clean_number(trade.get("Price", 0.0)) * int(clean_number(trade.get("Quantity", 0)))
+                commission = clean_number(trade.get("Commission", 0.0))
+                printed_net = clean_number(trade.get("Printed Net Value", 0.0))
+                printed_tax = clean_number(trade.get("Printed Taxes", 0.0))
+                
+                max_logical_tax = base_value * 0.05 
+                
+                if tx_type_raw == "PURCHASE":
+                    tx_type_raw = "BUY"
+                    trade["Transaction Type"] = "BUY"
+                
+                if tx_type_raw == "BUY":
+                    calc_tax = printed_net - base_value - commission
+                    if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
+                        trade["Taxes and Fees"] = round(calc_tax, 2)
+                        trade["Net Total Value"] = round(printed_net, 2)
+                    else:
+                        trade["Taxes and Fees"] = round(printed_tax, 2)
+                        trade["Net Total Value"] = round(base_value + commission + printed_tax, 2)
+                        
+                elif tx_type_raw == "SELL":
+                    calc_tax = base_value - printed_net - commission
+                    if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
+                        trade["Taxes and Fees"] = round(calc_tax, 2)
+                        trade["Net Total Value"] = round(printed_net, 2)
+                    else:
+                        trade["Taxes and Fees"] = round(printed_tax, 2)
+                        trade["Net Total Value"] = round(base_value - commission - printed_tax, 2)
             
-            trade.pop("Printed Net Value", None) 
-            trade.pop("Printed Taxes", None)
-            
+                trade.pop("Printed Net Value", None) 
+                trade.pop("Printed Taxes", None)
+                
         return trades_list
     except Exception as e:
         print(f"An error occurred during Vision extraction: {e}")
@@ -304,21 +352,43 @@ def parse_trade_data_with_groq(raw_text):
     1. "Ticker": Perform STRICT literal character-by-character transcription of the symbol column. DO NOT auto-correct spelling, and DO NOT inject extra vowels. Copy the letters EXACTLY as printed. Include the broker extensions (e.g., "-READY") if present.
     2. "Printed Taxes": Look at the "STRUCTURED TABLE DATA" section. Find the specific row for the trade. The numbers are separated by "|". Look for the Tax/Levy column for that specific row and extract the exact float. DO NOT calculate it.
     3. "Printed Net Value": Extract the absolute LAST number on the row for this specific trade. DO NOT extract the "Grand Total" from the bottom of the page.
-    4. NUMBERS & FORMAT: Output all numbers as floats WITHOUT commas (e.g., 1250.0).
+    4. CRITICAL IPO RULE: If the text contains "Subscription application has been successful" (e.g., eIPO emails), you MUST treat it as an IPO Allotment. Do NOT attempt to calculate the Price or Net Value. Map the "Security Name" to its exact PSX ticker (e.g., "SERVICE LONG MARCH TYRES LIMITED" -> "SLM"). Extract the exact "Amount Paid" and "Amount to be Refunded".
+    5. NUMBERS & FORMAT: Output all numbers as floats WITHOUT commas (e.g., 1250.0).
     
-    You MUST return a JSON object containing a single key "trades", which is a list of dictionaries.
-    Each dictionary represents one transaction and MUST include exactly these keys:
-    - "Trade Date" (Format: YYYY-MM-DD. Look in the RAW TEXT section).
-    - "Settlement Date" (Format: YYYY-MM-DD. Use Trade Date if not explicitly mentioned).
-    - "Transaction Type" (Must be exactly "BUY", "SELL", or "IPO")
-    - "Ticker" (Follow Rule 1)
-    - "Quantity" (Integer)
-    - "Price" (Float)
-    - "Commission" (Float. Default 0.0)
-    - "Printed Taxes" (Float. Default 0.0)
-    - "Printed Net Value" (Float. The final total for the row. Default 0.0)
-    - "IPO Amount Paid" (Float. Default 0.0)
-    - "IPO Amount Refunded" (Float. Default 0.0)
+    You MUST return a JSON object containing a single key "trades", which is a list of dictionaries. 
+    DO NOT include the keys "IPO Amount Paid" or "IPO Amount Refunded" for standard trades. DO NOT include "Printed Taxes" or "Commission" for IPOs.
+    
+    If it is a STANDARD TRADE, use exactly this format:
+    {{
+      "trades": [
+        {{
+          "Trade Date": "YYYY-MM-DD",
+          "Settlement Date": "YYYY-MM-DD",
+          "Transaction Type": "BUY",
+          "Ticker": "OGDC",
+          "Quantity": 1000,
+          "Price": 120.50,
+          "Commission": 15.00,
+          "Printed Taxes": 5.00,
+          "Printed Net Value": 120520.00
+        }}
+      ]
+    }}
+
+    If it is an IPO ALLOTMENT, use exactly this format:
+    {{
+      "trades": [
+        {{
+          "Trade Date": "YYYY-MM-DD",
+          "Settlement Date": "YYYY-MM-DD",
+          "Transaction Type": "IPO",
+          "Ticker": "SLM",
+          "Quantity": 584,
+          "IPO Amount Paid": 99750.0,
+          "IPO Amount Refunded": 88099.20
+        }}
+      ]
+    }}
     
     Raw Text:
     {raw_text}
@@ -326,7 +396,7 @@ def parse_trade_data_with_groq(raw_text):
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant", 
+            model="openai/gpt-oss-20b", 
             temperature=0, 
             response_format={"type": "json_object"} 
         )
@@ -337,62 +407,95 @@ def parse_trade_data_with_groq(raw_text):
         # --- PYTHON SANITY CHECK & MATH ---
         for trade in trades_list:
             
-            # --- THE TRUE REGEX FIX (No Dictionary Needed) ---
+            # 1. --- YOUR EXISTING REGEX & OCR FIXES ---
             raw_ticker = str(trade.get("Ticker", "")).upper().strip()
-            
-            # This safely removes extensions ONLY if preceded by a dash or space. 
-            # "OGDC-OCT" becomes "OGDC". "OCTOPUS" remains "OCTOPUS".
             clean_ticker = re.sub(r'[\-\s]+(READY|FUTURE|SPOT|JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b.*', '', raw_ticker).strip()
             
-            # 2. Fix the AI's visual reading errors
             if clean_ticker == "MZNPEETF":
                 clean_ticker = "MZNPETF"
             elif clean_ticker == "CENERGY":
                 clean_ticker = "CNERGY"
             
             trade["Ticker"] = clean_ticker
-            # -------------------------------------------------
             
-            base_value = trade.get("Price", 0.0) * trade.get("Quantity", 0)
-            commission = trade.get("Commission", 0.0)
-            printed_net = trade.get("Printed Net Value", 0.0)
-            printed_tax = trade.get("Printed Taxes", 0.0)
-            
-            max_logical_tax = base_value * 0.05 
-            
-            if trade.get("Transaction Type") == "IPO":
-                qty = trade.get("Quantity", 0)
-                paid = trade.get("IPO Amount Paid", 0.0)
-                refunded = trade.get("IPO Amount Refunded", 0.0)
-                if qty > 0:
-                    trade["Price"] = round((paid - refunded) / qty, 4)
+            def clean_number(val):
+                if isinstance(val, str):
+                    clean_str = re.sub(r'[^\d.]', '', val)
+                    return float(clean_str) if clean_str else 0.0
+                return float(val) if val else 0.0
+
+            tx_type_raw = str(trade.get("Transaction Type", "")).upper()
+            is_ipo_transaction = "IPO" in tx_type_raw or "ALLOTMENT" in tx_type_raw
+            has_ipo_keys = "IPO Amount Paid" in trade or "IPO Amount Refunded" in trade
+
+            # 2. --- IPO MATH FIX ---
+            if has_ipo_keys or is_ipo_transaction:
+                paid = clean_number(trade.get("IPO Amount Paid", 0.0))
+                refund = clean_number(trade.get("IPO Amount Refunded", 0.0))
+                qty = int(clean_number(trade.get("Quantity", 0)))
+                
+                # Math derivation
+                if paid > 0:
+                    net_total = paid - refund
+                    exact_price = net_total / qty if qty > 0 else 0.0
+                else:
+                    exact_price = clean_number(trade.get("Price", 0.0))
+                    net_total = exact_price * qty
+                    
+                # Force injection so Excel cells are NEVER empty
+                trade["Net Total Value"] = round(net_total, 2)
+                trade["Price"] = round(exact_price, 4)
                 trade["Commission"] = 0.0
                 trade["Taxes and Fees"] = 0.0
-                trade["Net Total Value"] = round((trade.get("Price", 0.0) * qty), 2)
+                trade["Transaction Type"] = "IPO"
                 
-            elif trade.get("Transaction Type") == "BUY":
-                calc_tax = printed_net - base_value - commission
-                if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
-                    trade["Taxes and Fees"] = round(calc_tax, 2)
-                    trade["Net Total Value"] = round(printed_net, 2)
-                else:
-                    trade["Taxes and Fees"] = round(printed_tax, 2)
-                    trade["Net Total Value"] = round(base_value + commission + printed_tax, 2)
+                # Ensure settlement date exists
+                if not trade.get("Settlement Date"):
+                    trade["Settlement Date"] = trade.get("Trade Date", "")
+                
+                trade.pop("IPO Amount Paid", None)
+                trade.pop("IPO Amount Refunded", None)
+                
+            # 3. --- STANDARD TRADE MATH ---
+            else:
+                base_value = clean_number(trade.get("Price", 0.0)) * int(clean_number(trade.get("Quantity", 0)))
+                commission = clean_number(trade.get("Commission", 0.0))
+                printed_net = clean_number(trade.get("Printed Net Value", 0.0))
+                printed_tax = clean_number(trade.get("Printed Taxes", 0.0))
+                
+                max_logical_tax = base_value * 0.05 
+                
+                if tx_type_raw == "PURCHASE":
+                    tx_type_raw = "BUY"
                     
-            elif trade.get("Transaction Type") == "SELL":
-                calc_tax = base_value - printed_net - commission
-                if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
-                    trade["Taxes and Fees"] = round(calc_tax, 2)
-                    trade["Net Total Value"] = round(printed_net, 2)
-                else:
-                    trade["Taxes and Fees"] = round(printed_tax, 2)
-                    trade["Net Total Value"] = round(base_value - commission - printed_tax, 2)
+                trade["Transaction Type"] = tx_type_raw
+                
+                # Ensure missing fields are populated for standard trades too
+                if tx_type_raw == "BUY":
+                    calc_tax = printed_net - base_value - commission
+                    if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
+                        trade["Taxes and Fees"] = round(calc_tax, 2)
+                        trade["Net Total Value"] = round(printed_net, 2)
+                    else:
+                        trade["Taxes and Fees"] = round(printed_tax, 2)
+                        trade["Net Total Value"] = round(base_value + commission + printed_tax, 2)
+                        
+                elif tx_type_raw == "SELL":
+                    calc_tax = base_value - printed_net - commission
+                    if printed_net > 0 and (0 <= calc_tax <= max_logical_tax):
+                        trade["Taxes and Fees"] = round(calc_tax, 2)
+                        trade["Net Total Value"] = round(printed_net, 2)
+                    else:
+                        trade["Taxes and Fees"] = round(printed_tax, 2)
+                        trade["Net Total Value"] = round(base_value - commission - printed_tax, 2)
+                
+                # Failsafe overrides so standard trades don't return blanks
+                trade["Price"] = clean_number(trade.get("Price", 0.0))
+                trade["Commission"] = commission
             
-            trade.pop("IPO Amount Paid", None)
-            trade.pop("IPO Amount Refunded", None)
-            trade.pop("Printed Net Value", None) 
-            trade.pop("Printed Taxes", None)
-            
+                trade.pop("Printed Net Value", None) 
+                trade.pop("Printed Taxes", None)
+                
         return trades_list
     except Exception as e:
         print(f"An error occurred during trade extraction: {e}")
@@ -426,7 +529,7 @@ def parse_dividend_data_with_groq(raw_text):
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant", 
+            model="openai/gpt-oss-20b", 
             temperature=0, 
             response_format={"type": "json_object"} 
         )
@@ -498,7 +601,7 @@ def parse_funds_data_with_groq(raw_text):
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant", 
+            model="openai/gpt-oss-20b", 
             temperature=0, 
             response_format={"type": "json_object"} 
         )
